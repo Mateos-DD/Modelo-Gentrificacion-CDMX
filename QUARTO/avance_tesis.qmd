@@ -1,0 +1,278 @@
+---
+title: "Modelos Dinámicos de Gentrificación: Réplica para Ciudad de México"
+subtitle: "Presentación de tesis — Abril 2026"
+author: "Kevin Mateos Coleptor"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    code-fold: true
+    code-summary: "Mostrar código"
+    self-contained: true
+execute:
+  warning: false
+  echo: true
+jupyter: python3
+---
+
+## Introducción
+
+Este documento presenta el avance de la réplica del modelo de simulación
+basado en agentes (ABM) propuesto por Mauro et al. (2025) para estudiar
+la dinámica de gentrificación urbana, adaptado al contexto de la
+Ciudad de México.
+
+El modelo original utiliza datos de ingreso de la Social Security
+Administration (SSA) de Estados Unidos. Esta adaptación reemplaza
+esos datos con microdatos de la Encuesta Nacional de Ingresos y
+Gastos de los Hogares (ENIGH) 2022 y datos del Censo de Población
+y Vivienda 2020 de INEGI.
+
+**Referencia:** Mauro, G., Pedreschi, N., Lambiotte, R., & Pappalardo, L.
+(2025). *Dynamic models of gentrification.* Advances in Complex Systems.
+DOI: 10.1142/S0219525925400065
+
+```{python}
+#| label: setup
+#| echo: false
+
+# ── Resolver ruta base del proyecto ──────────────────────────
+# Quarto ejecuta el código desde el directorio del .qmd (QUARTO/).
+# Necesitamos movernos a CDMX/ donde están income/ y out/.
+import os
+from pathlib import Path
+
+_cwd = Path.cwd()
+# Si estamos en QUARTO/ o docs/, subir un nivel a CDMX/
+if _cwd.name in ("QUARTO", "docs"):
+    os.chdir(_cwd.parent)
+# Si no encontramos income/, buscar hacia arriba
+elif not (_cwd / "income").is_dir():
+    _search = _cwd
+    while _search != _search.parent:
+        if (_search / "income").is_dir():
+            os.chdir(_search)
+            break
+        _search = _search.parent
+
+print(f"Directorio de trabajo: {os.getcwd()}")
+assert os.path.isdir("income"), f"ERROR: no se encuentra income/ en {os.getcwd()}"
+```
+
+## Datos de entrada
+
+### Distribución de ingresos CDMX
+
+Se construyeron 60 tramos de ingreso de igual peso poblacional (~1.67%
+cada uno) a partir del Concentrado ENIGH 2022, filtrando por hogares
+de las 16 alcaldías de CDMX (códigos `ubica_geo` 9002–9017).
+
+```{python}
+import pandas as pd
+import numpy as np
+import json
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+
+# Cargar distribución de ingresos
+income = pd.read_csv("income/income_clean_CDMX_v2.csv")
+cutoffs = json.load(open("income/cdmx_cutoffs.json"))
+
+print(f"Tramos de ingreso: {len(income)}")
+print(f"Hogares expandidos totales: {income['number'].sum():,.0f}")
+print(f"\nCutoffs L/M/H:")
+print(f"  L (bajo):  ≤ ${cutoffs['L_bound_high']:>12,.0f} MXN/año  ({cutoffs['pct_L']}%)")
+print(f"  M (medio): ${cutoffs['L_bound_high']:>12,.0f} – ${cutoffs['H_bound_low']:>12,.0f} MXN/año  ({cutoffs['pct_M']}%)")
+print(f"  H (alto):  > ${cutoffs['H_bound_low']:>12,.0f} MXN/año  ({cutoffs['pct_H']}%)")
+```
+
+```{python}
+#| label: fig-distribucion-ingresos
+#| fig-cap: "Distribución de ingresos CDMX 2022 en 60 tramos equiponderados. Rojo = L (bajo ingreso, 38.3%), Azul = M (medio, 56.7%), Verde = H (alto, 5.0%)."
+
+fig, ax = plt.subplots(figsize=(12, 5))
+
+row_L = cutoffs["row_L_max"]  # 22
+row_H = cutoffs["row_H_min"]  # 57
+
+colors = []
+for i in range(len(income)):
+    if i <= row_L:
+        colors.append("#E24B4A")
+    elif i >= row_H:
+        colors.append("#1D9E75")
+    else:
+        colors.append("#378ADD")
+
+ax.bar(range(len(income)), income["percent"], color=colors, alpha=0.85, edgecolor="white", linewidth=0.3)
+ax.set_xlabel("Tramo de ingreso (bracket)", fontsize=12)
+ax.set_ylabel("% de hogares", fontsize=12)
+ax.set_title("Distribución de ingresos CDMX 2022 — ENIGH microdata, 60 tramos", fontsize=13)
+
+# Leyenda manual
+from matplotlib.patches import Patch
+legend_elements = [
+    Patch(facecolor="#E24B4A", label=f"L — bajo ingreso ({cutoffs['pct_L']}%)"),
+    Patch(facecolor="#378ADD", label=f"M — medio ingreso ({cutoffs['pct_M']}%)"),
+    Patch(facecolor="#1D9E75", label=f"H — alto ingreso ({cutoffs['pct_H']}%)"),
+]
+ax.legend(handles=legend_elements, loc="upper right", fontsize=10)
+ax.set_xlim(-0.5, len(income) - 0.5)
+plt.tight_layout()
+plt.show()
+```
+
+### Comparación con el paper original
+
+| Categoría | Paper USA (SSA 2022) | CDMX (ENIGH 2022) | Diferencia |
+|-----------|---------------------|--------------------|------------|
+| L (bajo)  | 38%                 | 38.31%             | +0.31 pp   |
+| M (medio) | 57%                 | 56.67%             | −0.33 pp   |
+| H (alto)  | 5%                  | 5.02%              | +0.02 pp   |
+
+: Proporciones L/M/H calibradas. La diferencia es menor a 0.5 puntos
+porcentuales en cada categoría. {#tbl-proporciones}
+
+### Clustering K-means por AGEB
+
+Se aplicó K-means a los 2,433 AGEBs urbanos del Censo 2020 para
+justificar empíricamente la subdivisión de alcaldías en celdas del
+grid 5×5 = 25 celdas.
+
+```{python}
+#| label: tbl-kmeans
+#| tbl-cap: "Resultados del clustering K-means por alcaldía"
+
+clusters = pd.read_csv("income/ageb_clusters.csv")
+cell_map = json.load(open("income/alcaldia_to_cells.json"))
+
+# Tabla resumen
+resumen = []
+for alc, cells in sorted(cell_map.items()):
+    n_ageb = len(clusters[clusters["alcaldia"] == alc])
+    k = len(cells)
+    resumen.append({
+        "Alcaldía": alc,
+        "AGEBs": n_ageb,
+        "K (celdas)": k,
+        "Cell IDs": str(cells),
+    })
+
+df_resumen = pd.DataFrame(resumen)
+print(df_resumen.to_markdown(index=False))
+```
+
+```{python}
+#| label: fig-poblacion-celdas
+#| fig-cap: "Población total por celda del grid, calculada como suma de POBTOT de los AGEBs asignados a cada cluster."
+
+pop_by_cell = clusters.groupby("cell_id")["POBTOT"].sum().sort_index()
+
+fig, ax = plt.subplots(figsize=(12, 5))
+bars = ax.bar(pop_by_cell.index, pop_by_cell.values, color="#378ADD", alpha=0.8, edgecolor="white")
+
+# Etiquetas de alcaldía
+cell_to_alc = {}
+for alc, cells in cell_map.items():
+    for c in cells:
+        cell_to_alc[c] = alc
+
+for i, bar in enumerate(bars):
+    alc_name = cell_to_alc.get(i, "")
+    short = alc_name.replace("Gustavo A. Madero", "GAM") \
+                     .replace("La Magdalena Contreras", "Magdalena C.") \
+                     .replace("Cuajimalpa de Morelos", "Cuajimalpa") \
+                     .replace("Venustiano Carranza", "V. Carranza") \
+                     .replace("Álvaro Obregón", "Á. Obregón")
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 5000,
+            short, ha="center", va="bottom", fontsize=7, rotation=45)
+
+ax.set_xlabel("Cell ID en el grid", fontsize=12)
+ax.set_ylabel("Población total (POBTOT)", fontsize=12)
+ax.set_title("Población por celda del grid 5×5", fontsize=13)
+ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x/1e3:.0f}k"))
+plt.tight_layout()
+plt.show()
+```
+
+## Configuración del modelo
+
+El modelo `GentModelCDMX` hereda la estructura del ABM original con
+las siguientes adaptaciones para CDMX:
+
+```{python}
+config = {
+    "Grid": "5×5 = 25 celdas (vs 7×7 original)",
+    "Agentes": "4,096 (2¹² — escala media del paper)",
+    "Pasos": "300 por repetición",
+    "Repeticiones": "150 por valor de p_g",
+    "Valores de p_g": "0.0, 0.01, 0.05, 0.1, 0.15",
+    "h (ventana temporal)": "20 pasos",
+    "Modo": "improve (modelo principal)",
+    "Deployment inicial": "centre_segr (H al centro)",
+    "CSV de ingresos": "income_clean_CDMX_v2.csv (60 tramos)",
+    "Cutoff L/M": "row ≤ 22 → C (bajo)",
+    "Cutoff M/H": "row < 57 → B (medio), else → A (alto)",
+}
+
+for k, v in config.items():
+    print(f"  {k:<25} {v}")
+```
+
+## Estado de las simulaciones
+
+```{python}
+import glob
+
+exps_dir = "out/batch_results/improve/centre_segr-big/4096agents/exps/"
+inter_dir = "out/batch_results/improve/centre_segr-big/4096agents/intermediate/"
+
+if os.path.exists(exps_dir):
+    n_exps = len(glob.glob(os.path.join(exps_dir, "*.csv")))
+    print(f"Archivos de simulación: {n_exps} (esperado: 1,500)")
+    print(f"  = 150 reps × 5 p_g × 2 archivos (model + agents)")
+else:
+    print(f"⚠ Directorio de simulaciones no encontrado: {exps_dir}")
+    print(f"  (esto es normal si no has corrido las simulaciones aún)")
+
+if os.path.exists(inter_dir):
+    n_inter = len(glob.glob(os.path.join(inter_dir, "*.csv")))
+    print(f"Archivos de métricas: {n_inter} (esperado: 2,250)")
+    print(f"  = 150 reps × 5 p_g × 3 métricas (chi_hat, chi, net)")
+else:
+    print(f"⚠ Directorio de métricas no encontrado: {inter_dir}")
+    print(f"  (esto es normal si no has corrido el post-procesamiento)")
+```
+
+### Verificación de proporciones L/M/H
+
+```{python}
+agents_files = sorted(glob.glob(os.path.join(exps_dir, "*agents*.csv"))) if os.path.exists(exps_dir) else []
+
+if len(agents_files) > 0:
+    df_check = pd.read_csv(agents_files[0])
+    props = df_check[df_check["Step"] == 1]["tipo"].value_counts(normalize=True) * 100
+    print("Proporciones reales de agentes (primera simulación):")
+    print(f"  L (tipo C): {props.get('C', 0):.1f}%  — objetivo: 38.3%")
+    print(f"  M (tipo B): {props.get('B', 0):.1f}%  — objetivo: 56.7%")
+    print(f"  H (tipo A): {props.get('A', 0):.1f}%  — objetivo:  5.0%")
+else:
+    print("⚠ No hay archivos de simulación disponibles para verificar.")
+    print("  Ejecuta primero:")
+    print("  python run_batch_cdmx.py --mode improve --num_agents 4096 \\")
+    print("      --rep_start 0 --rep_end 50 --workers 6 --steps 300")
+```
+
+## Próximos pasos
+
+1. **Cálculo de métricas G_bin y G_net** — Post-procesamiento de las
+   150×5 simulaciones con `batch_calculate_gs_ind_metrics.py`.
+2. **Análisis comparativo** — Reproducir Figuras 3, 5 y 6 del paper
+   original con los resultados de CDMX.
+3. **Validación externa** — Comparar zonas con alto G_net contra
+   datos observables de precios de renta (Inside Airbnb CDMX).
+4. **Extensión geoespacial** — Incorporar shapefiles de AGEB para
+   visualizar clusters en mapa de CDMX.

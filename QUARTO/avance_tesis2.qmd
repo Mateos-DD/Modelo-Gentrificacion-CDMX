@@ -1,0 +1,427 @@
+---
+title: "Modelos Dinámicos de Gentrificación: Réplica para Ciudad de México"
+subtitle: "Avance de tesis — Abril 2026"
+author: "[Kevin Mateos Coleptor]"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    code-fold: true
+    code-summary: "Mostrar código"
+    self-contained: true
+execute:
+  warning: false
+  echo: true
+jupyter: python3
+---
+
+```{python}
+#| label: setup
+#| echo: false
+import os
+from pathlib import Path
+
+_cwd = Path.cwd()
+if _cwd.name in ("QUARTO", "docs"):
+    os.chdir(_cwd.parent)
+elif not (_cwd / "income").is_dir():
+    _search = _cwd
+    while _search != _search.parent:
+        if (_search / "income").is_dir():
+            os.chdir(_search)
+            break
+        _search = _search.parent
+
+PLOTS = "out/plots/centre_segr-big/4096"
+```
+
+## Introducción
+
+Este documento presenta el avance de la réplica del modelo de simulación basado en agentes (ABM) propuesto por Mauro et al. (2025) para estudiar la dinámica de gentrificación urbana, adaptado al contexto de la Ciudad de México.
+
+**Referencia:** Mauro, G., Pedreschi, N., Lambiotte, R., & Pappalardo, L. (2025). *Dynamic models of gentrification.* Advances in Complex Systems. DOI: 10.1142/S0219525925400065
+
+### Definiciones: métricas de gentrificación
+
+El modelo utiliza dos métricas complementarias para detectar gentrificación:
+
+**G~bin~ (count-based):** Mide si la proporción de residentes M+H en una celda supera un umbral fijo. Es una fotografía estática e irreversible — una vez que la composición cruza el umbral, G~bin~ = 1 permanentemente.
+
+**G~net~ (network-based, propuesta por Mauro et al.):** Mide simultáneamente la *salida neta* de residentes L y la *entrada neta* de residentes M+H usando flujos en redes temporales dirigidas. Captura el proceso dinámico como media geométrica de ambos flujos. La hipótesis central del paper es que G~net~ detecta la gentrificación *antes* que G~bin~.
+
+## Datos de entrada
+
+### Distribución de ingresos CDMX
+
+```{python}
+import pandas as pd
+import numpy as np
+import json
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+
+income = pd.read_csv("income/income_clean_CDMX_v2.csv")
+cutoffs = json.load(open("income/cdmx_cutoffs.json"))
+
+print(f"Tramos de ingreso: {len(income)}")
+print(f"Hogares expandidos totales: {income['number'].sum():,.0f}")
+print(f"\nCutoffs L/M/H:")
+print(f"  L (bajo):  ≤ ${cutoffs['L_bound_high']:>12,.0f} MXN/año  ({cutoffs['pct_L']}%)")
+print(f"  M (medio): ${cutoffs['L_bound_high']:>12,.0f} – ${cutoffs['H_bound_low']:>12,.0f} MXN/año  ({cutoffs['pct_M']}%)")
+print(f"  H (alto):  > ${cutoffs['H_bound_low']:>12,.0f} MXN/año  ({cutoffs['pct_H']}%)")
+```
+
+```{python}
+#| label: fig-distribucion-ingresos
+#| fig-cap: "Distribución de ingresos CDMX 2022 en 60 tramos equiponderados."
+
+fig, ax = plt.subplots(figsize=(12, 5))
+row_L, row_H = cutoffs["row_L_max"], cutoffs["row_H_min"]
+colors = ["#E24B4A" if i <= row_L else ("#1D9E75" if i >= row_H else "#378ADD") for i in range(len(income))]
+ax.bar(range(len(income)), income["percent"], color=colors, alpha=0.85, edgecolor="white", linewidth=0.3)
+ax.set_xlabel("Tramo de ingreso (bracket)", fontsize=12)
+ax.set_ylabel("% de hogares", fontsize=12)
+ax.set_title("Distribución de ingresos CDMX 2022 — ENIGH microdata, 60 tramos", fontsize=13)
+from matplotlib.patches import Patch
+ax.legend(handles=[
+    Patch(facecolor="#E24B4A", label=f"L — bajo ({cutoffs['pct_L']}%)"),
+    Patch(facecolor="#378ADD", label=f"M — medio ({cutoffs['pct_M']}%)"),
+    Patch(facecolor="#1D9E75", label=f"H — alto ({cutoffs['pct_H']}%)"),
+], loc="upper right", fontsize=10)
+ax.set_xlim(-0.5, len(income) - 0.5)
+plt.tight_layout()
+plt.show()
+```
+
+### Comparación con el paper original
+
+| Categoría | Paper USA (SSA 2022) | CDMX (ENIGH 2022) | Diferencia |
+|-----------|---------------------|--------------------|------------|
+| L (bajo)  | 38%                 | 38.31%             | +0.31 pp   |
+| M (medio) | 57%                 | 56.67%             | −0.33 pp   |
+| H (alto)  | 5%                  | 5.02%              | +0.02 pp   |
+
+: Proporciones L/M/H calibradas con diferencia < 0.5 pp por categoría. {#tbl-proporciones}
+
+### Clustering K-means por AGEB
+
+```{python}
+clusters = pd.read_csv("income/ageb_clusters.csv")
+cell_map = json.load(open("income/alcaldia_to_cells.json"))
+
+resumen = []
+for alc, cells in sorted(cell_map.items()):
+    n_ageb = len(clusters[clusters["alcaldia"] == alc])
+    resumen.append({"Alcaldía": alc, "AGEBs": n_ageb, "K (celdas)": len(cells), "Cell IDs": str(cells)})
+
+print(pd.DataFrame(resumen).to_markdown(index=False))
+```
+
+```{python}
+#| label: fig-poblacion-celdas
+#| fig-cap: "Población total por celda del grid, calculada como suma de POBTOT de los AGEBs asignados."
+
+pop_by_cell = clusters.groupby("cell_id")["POBTOT"].sum().sort_index()
+fig, ax = plt.subplots(figsize=(12, 5))
+bars = ax.bar(pop_by_cell.index, pop_by_cell.values, color="#378ADD", alpha=0.8, edgecolor="white")
+cell_to_alc = {c: alc for alc, cells in cell_map.items() for c in cells}
+for i, bar in enumerate(bars):
+    short = cell_to_alc.get(i, "").replace("Gustavo A. Madero", "GAM") \
+        .replace("La Magdalena Contreras", "Mag.C.").replace("Cuajimalpa de Morelos", "Cuajim.") \
+        .replace("Venustiano Carranza", "V.Carr.").replace("Álvaro Obregón", "Á.Obr.")
+    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 5000, short, ha="center", va="bottom", fontsize=7, rotation=45)
+ax.set_xlabel("Cell ID en el grid", fontsize=12)
+ax.set_ylabel("Población total (POBTOT)", fontsize=12)
+ax.set_title("Población por celda del grid 5×5", fontsize=13)
+ax.yaxis.set_major_formatter(mticker.FuncFormatter(lambda x, _: f"{x/1e3:.0f}k"))
+plt.tight_layout()
+plt.show()
+```
+
+## Configuración del modelo
+
+```{python}
+config = {
+    "Grid": "5×5 = 25 celdas (vs 7×7 original)",
+    "Agentes": "4,096 (2¹²)",
+    "Pasos": "300 por repetición",
+    "Repeticiones": "150 por valor de p_g",
+    "Valores de p_g": "0.0, 0.01, 0.05, 0.1, 0.15",
+    "h (ventana temporal)": "20 pasos",
+    "Modo": "improve (modelo principal)",
+    "Deployment inicial": "centre_segr-big",
+    "Cutoff L/M": "row ≤ 22 → C (bajo)",
+    "Cutoff M/H": "row < 57 → B (medio), else → A (alto)",
+}
+for k, v in config.items():
+    print(f"  {k:<25} {v}")
+```
+
+## Resultados de las simulaciones
+
+### Estado de los datos
+
+```{python}
+import glob
+
+exps_dir = "out/batch_results/improve/centre_segr-big/4096agents/exps/"
+inter_dir = "out/batch_results/improve/centre_segr-big/4096agents/intermediate/"
+
+if os.path.exists(exps_dir):
+    n_exps = len(glob.glob(os.path.join(exps_dir, "*.csv")))
+    print(f"Archivos de simulación: {n_exps} (esperado: 1,500)")
+else:
+    print(f"⚠ Directorio de simulaciones no encontrado")
+
+if os.path.exists(inter_dir):
+    n_inter = len(glob.glob(os.path.join(inter_dir, "*.csv")))
+    print(f"Archivos de métricas:   {n_inter} (esperado: 6,750)")
+else:
+    print(f"⚠ Directorio de métricas no encontrado")
+```
+
+### Verificación de proporciones L/M/H
+
+```{python}
+agents_files = sorted(glob.glob(os.path.join(exps_dir, "*agents*.csv"))) if os.path.exists(exps_dir) else []
+if agents_files:
+    df_check = pd.read_csv(agents_files[0])
+    props = df_check[df_check["Step"] == 1]["tipo"].value_counts(normalize=True) * 100
+    print("Proporciones reales (primera simulación):")
+    print(f"  L (tipo C): {props.get('C', 0):.1f}%  — objetivo: 38.3%")
+    print(f"  M (tipo B): {props.get('B', 0):.1f}%  — objetivo: 56.7%")
+    print(f"  H (tipo A): {props.get('A', 0):.1f}%  — objetivo:  5.0%")
+else:
+    print("⚠ No hay archivos de simulación disponibles.")
+```
+
+### G~bin~ y G~net~ por p~H~ — Boxplots (Fig. 2 del paper)
+
+```{python}
+#| echo: false
+boxplot_path = f"{PLOTS}/cdmx_boxplot_Gbin_Gnet.pdf"
+if os.path.exists(boxplot_path):
+    from IPython.display import Image, display
+    # Convertir PDF a imagen si es necesario, o usar PNG si existe
+    png_path = boxplot_path.replace(".pdf", ".png")
+    if os.path.exists(png_path):
+        display(Image(filename=png_path, width=800))
+    else:
+        print(f"📊 Figura disponible en: {boxplot_path}")
+        print("   (Abrir manualmente — Quarto no renderiza PDFs inline)")
+else:
+    print(f"⚠ Figura no encontrada: {boxplot_path}")
+```
+
+**Resultados numéricos:**
+
+```{python}
+#| echo: false
+data = {
+    "p_H": [0.00, 0.01, 0.05, 0.10, 0.15],
+    "G_bin mediana (%)": [0.0, 16.0, 20.0, 28.0, 52.0],
+    "G_bin std (%)": [2.3, 10.3, 12.0, 22.7, 25.8],
+    "G_net mediana (%)": [16.0, 36.0, 38.0, 48.0, 68.0],
+    "G_net std (%)": [5.1, 10.7, 13.1, 21.6, 23.8],
+}
+df_summary = pd.DataFrame(data)
+print(df_summary.to_markdown(index=False))
+```
+
+**Hallazgos principales:**
+
+- La gentrificación crece monotónicamente con p~H~. Sin movimiento estratégico de agentes H (p~H~ = 0), G~bin~ es prácticamente nulo.
+- G~net~ siempre detecta más celdas gentrificadas que G~bin~ (~18 pp de diferencia promedio), confirmando mayor sensibilidad de la métrica basada en redes.
+- Para p~H~ = 0.15, G~net~ detecta gentrificación en el 68% de las 25 celdas (mediana de 150 réplicas).
+- La variabilidad aumenta con p~H~, reflejando mayor dependencia de la configuración inicial.
+
+### Sensibilidad al número de agentes (curva de densidad)
+
+```{python}
+#| echo: false
+density_path = f"{PLOTS}/cdmx_density_curves.pdf"
+if os.path.exists(density_path):
+    png_path = density_path.replace(".pdf", ".png")
+    if os.path.exists(png_path):
+        display(Image(filename=png_path, width=800))
+    else:
+        print(f"📊 Figura disponible en: {density_path}")
+else:
+    print(f"⚠ Figura no encontrada: {density_path}")
+```
+
+**Hallazgos:**
+
+- A mayor densidad de agentes, mayor gentrificación. Para p~H~ = 0.15, G~net~ pasa de ~30% con N=1024 a ~85% con N=8192.
+- El efecto es más pronunciado para p~H~ altos — la densidad amplifica el movimiento estratégico.
+- N = 4096 (el tamaño de nuestras simulaciones principales) está en la zona media de la curva.
+
+### Réplica individual — G~net~ y riqueza mediana (Fig. 3 del paper)
+
+```{python}
+#| echo: false
+single_path = f"{PLOTS}/cdmx_single_run_pg0.1_rep0.pdf"
+if os.path.exists(single_path):
+    png_path = single_path.replace(".pdf", ".png")
+    if os.path.exists(png_path):
+        display(Image(filename=png_path, width=500))
+    else:
+        print(f"📊 Figura disponible en: {single_path}")
+else:
+    print(f"⚠ Figura no encontrada: {single_path}")
+```
+
+**Interpretación:**
+
+- **Panel a) G~net~:** 12 de 25 celdas (48%) mostraron al menos un evento de gentrificación. Los picos son transitorios — reflejan el momento de máxima actividad de flujos, no un estado permanente.
+- **Panel b) Riqueza mediana:** Antes de h+1 = 21, todas las celdas tienen riquezas similares (~$200k–$400k MXN). Después, las celdas gentrificadas saltan a >$1M MXN, visualizando la segregación emergente.
+- La línea vertical en x = 21 marca el momento en que los agentes H comienzan a moverse estratégicamente. Los picos de G~net~ aparecen inmediatamente después.
+
+### Susceptibilidad por alcaldía — Heatmap y ranking
+
+```{python}
+#| echo: false
+alc_path = f"{PLOTS}/cdmx_gentrif_por_alcaldia.pdf"
+if os.path.exists(alc_path):
+    png_path = alc_path.replace(".pdf", ".png")
+    if os.path.exists(png_path):
+        display(Image(filename=png_path, width=900))
+    else:
+        print(f"📊 Figura disponible en: {alc_path}")
+else:
+    print(f"⚠ Figura no encontrada: {alc_path}")
+```
+
+**Ranking de susceptibilidad (p~H~ = 0.1):**
+
+```{python}
+#| echo: false
+ranking = [
+    ("Azcapotzalco", 1, 100.0), ("Coyoacán", 1, 100.0), ("Cuajimalpa", 1, 100.0),
+    ("Iztacalco", 1, 100.0), ("Magdalena C.", 1, 100.0), ("Tláhuac", 1, 100.0),
+    ("V. Carranza", 1, 100.0), ("Xochimilco", 1, 100.0), ("Á. Obregón", 2, 100.0),
+    ("Benito Juárez", 2, 50.0), ("Cuauhtémoc", 2, 50.0), ("Miguel Hidalgo", 2, 50.0),
+    ("Tlalpan", 2, 50.0), ("GAM", 3, 33.3), ("Iztapalapa", 3, 33.3), ("Milpa Alta", 1, 0.0),
+]
+df_rank = pd.DataFrame(ranking, columns=["Alcaldía", "Celdas", "G_net med (%)"])
+print(df_rank.to_markdown(index=False))
+```
+
+**Nota interpretativa:** Las alcaldías con 1 celda muestran 100% trivialmente (cualquier evento cubre toda su representación). La comparación sustantiva es entre alcaldías con igual K: entre las de 2 celdas, Álvaro Obregón (100%) es más susceptible que Benito Juárez (50%). Milpa Alta (0%) es la única sin gentrificación, consistente con su perfil rural-periurbano homogéneo.
+
+## Visualización de flujos (Fig. 4a/4b del paper)
+
+### G~bin~ vs G~net~ en una celda — Cherry-pick
+
+```{python}
+#| echo: false
+cherry_path = f"{PLOTS}/cdmx_cherry_pg0.1_rep0.pdf"
+if os.path.exists(cherry_path):
+    png_path = cherry_path.replace(".pdf", ".png")
+    if os.path.exists(png_path):
+        display(Image(filename=png_path, width=500))
+    else:
+        print(f"📊 Figura disponible en: {cherry_path}")
+else:
+    print(f"⚠ Figura no encontrada: {cherry_path}")
+```
+
+**Hallazgo:** G~bin~ (negro) salta irreversiblemente de 0 a 1, mientras que G~net~ (amarillo) muestra un pico transitorio que captura el *proceso* de gentrificación. G~net~ detecta el evento antes que G~bin~.
+
+### Grafos de flujo — Desplazamiento en acción
+
+```{python}
+#| echo: false
+flows_during = f"{PLOTS}/cdmx_flows_during_pg0.1_rep0.pdf"
+flows_post = f"{PLOTS}/cdmx_flows_post_pg0.1_rep0.pdf"
+
+for label, path in [("Durante el pico (t=21)", flows_during), ("Post-pico (t=29)", flows_post)]:
+    if os.path.exists(path):
+        png_path = path.replace(".pdf", ".png")
+        if os.path.exists(png_path):
+            print(f"\n{label}:")
+            display(Image(filename=png_path, width=600))
+        else:
+            print(f"📊 {label}: {path}")
+    else:
+        print(f"⚠ {label}: no encontrada")
+```
+
+**Interpretación:** Los grafos muestran la firma visual de la gentrificación como proceso de *displacement* (desplazamiento). Las flechas rojas representan agentes L saliendo de la celda focal; las flechas verde-azul representan agentes M+H entrando. El tamaño de los nodos refleja riqueza mediana — el nodo focal crece entre t=21 y t=29.
+
+## Análisis de alerta temprana (Fig. 4c del paper)
+
+### Cross-correlación G~bin~ vs G~net~
+
+```{python}
+#| echo: false
+xcorr_path = f"{PLOTS}/cdmx_ALL_cross_correlation.pdf"
+if os.path.exists(xcorr_path):
+    png_path = xcorr_path.replace(".pdf", ".png")
+    if os.path.exists(png_path):
+        display(Image(filename=png_path, width=800))
+    else:
+        print(f"📊 Figura disponible en: {xcorr_path}")
+else:
+    print(f"⚠ Figura no encontrada: {xcorr_path}")
+```
+
+**Hallazgo central:** El pico de correlación está en τ negativo (τ ≈ −1 a −3), confirmando que **G~net~ precede a G~bin~ por 1–3 pasos temporales**. La señal es significativamente mayor que el baseline shuffled (banda gris). A mayor p~H~, más fuerte la señal de alerta temprana.
+
+### Información mutua
+
+```{python}
+#| echo: false
+mi_path = f"{PLOTS}/cdmx_mutual_information.pdf"
+if os.path.exists(mi_path):
+    png_path = mi_path.replace(".pdf", ".png")
+    if os.path.exists(png_path):
+        display(Image(filename=png_path, width=500))
+    else:
+        print(f"📊 Figura disponible en: {mi_path}")
+else:
+    print(f"⚠ Figura no encontrada: {mi_path}")
+```
+
+La información mutua (métrica no lineal) confirma independientemente el desfase: pico en τ = −1 para todos los p~H~.
+
+### Barcodes — Eventos discretos
+
+```{python}
+#| echo: false
+barcode_path = f"{PLOTS}/cdmx_barcodes_pg0.15_rep0.pdf"
+if os.path.exists(barcode_path):
+    png_path = barcode_path.replace(".pdf", ".png")
+    if os.path.exists(png_path):
+        display(Image(filename=png_path, width=400))
+    else:
+        print(f"📊 Figura disponible en: {barcode_path}")
+else:
+    print(f"⚠ Figura no encontrada: {barcode_path}")
+```
+
+**Interpretación:** G~net~ genera 2–3 barras (eventos múltiples) vs. 1 barra de G~bin~ (evento único e irreversible). Las barras amarillas de G~net~ aparecen *antes* que la barra negra de G~bin~, consistente con el análisis de cross-correlación.
+
+## Resumen de hallazgos
+
+1. **El modelo se replica exitosamente con datos CDMX.** Las proporciones L/M/H (38.3/56.7/5.0%) son prácticamente idénticas al paper USA y los patrones cualitativos se preservan.
+
+2. **G~net~ detecta gentrificación 1–3 pasos antes que G~bin~**, validado tanto con cross-correlación como con información mutua. Esto confirma su utilidad como sistema de alerta temprana.
+
+3. **La gentrificación crece con p~H~.** Sin movimiento estratégico de agentes H (p~H~ = 0), la gentrificación es mínima.
+
+4. **La densidad urbana amplifica la gentrificación**, especialmente para p~H~ altos. CDMX, con su alta densidad real, es un contexto donde este mecanismo sería particularmente relevante.
+
+5. **Milpa Alta es la única alcaldía sin gentrificación** en la mediana (G~net~ = 0%), consistente con su perfil rural y homogéneo.
+
+6. **Los grafos de flujo confirman el mecanismo de desplazamiento:** la gentrificación es un proceso activo de expulsión de L y atracción de M+H, no solo un cambio pasivo de composición.
+
+## Limitaciones y trabajo futuro
+
+- **Resolución del grid:** 25 celdas para 16 alcaldías limita las comparaciones alcaldía-por-alcaldía.
+- **Validación externa:** Falta comparar con datos observables (precios de renta, Inside Airbnb).
+- **Calibración temporal:** Los "pasos" del modelo no tienen correspondencia directa con años reales.
+- **Heterogeneidad espacial:** El modelo trata celdas como equivalentes; en la realidad, centro ≠ periferia.
